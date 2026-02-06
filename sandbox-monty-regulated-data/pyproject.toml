@@ -1,0 +1,23 @@
+[project]
+name = "healthcare-monty-sandbox"
+version = "0.1.0"
+description = "AI agent that generates and executes healthcare data pipeline code in a secure Monty sandbox"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic-monty",
+    "anthropic",
+    "rich",
+]
+
+[project.scripts]
+healthcare-agent = "healthcare_agent.pipeline:run_pipeline"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
