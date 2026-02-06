@@ -11,6 +11,8 @@ In healthcare data engineering, you need to:
 
 Monty solves this: it's a sandboxed Python interpreter with microsecond startup, no containers needed.
 
+<img width="1402" height="584" alt="mon" src="https://github.com/user-attachments/assets/6d53c9f1-b882-4cb6-a11d-32b33fb1636c" />
+
 ## What It Does
 
 The app runs a 3-step data pipeline on fake patient records:
