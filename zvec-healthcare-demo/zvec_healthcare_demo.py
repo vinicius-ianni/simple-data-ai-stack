@@ -10,6 +10,7 @@
 #   "orjson>=3.9.0",
 #   "faiss-cpu>=1.8.0",
 #   "chromadb>=0.5.0",
+#   "usearch>=2.0.0",
 # ]
 # ///
 """
@@ -51,6 +52,7 @@ from typing import Optional
 import chromadb
 import faiss
 import numpy as np
+from usearch.index import Index as USearchIndex
 import orjson
 import polars as pl
 import zvec
@@ -711,19 +713,55 @@ def bench_chromadb_filtered(col: "chromadb.Collection", query_vecs: np.ndarray, 
     return float(np.mean(latencies)) * 1000  # ms
 
 
+# ─── USearch Benchmarking ─────────────────────────────────────────────────────
+
+def setup_usearch_index(embeddings: np.ndarray) -> tuple:
+    """Build a USearch HNSW index (cosine metric, matching HNSW params across all libs).
+
+    USearch handles cosine normalisation internally — no pre-normalisation needed.
+    Persistence: manual save()/load() — not automatic like zvec.
+    Filtering: NOT available in Python bindings yet (C++/Rust only).
+    """
+    index = USearchIndex(
+        ndim=EMBEDDING_DIM,
+        metric="cos",
+        connectivity=16,       # M — matches zvec/FAISS/ChromaDB defaults
+        expansion_add=40,      # efConstruction
+        expansion_search=64,   # efSearch
+    )
+    keys = np.arange(len(embeddings), dtype=np.uint64)
+    t0 = time.perf_counter()
+    index.add(keys, embeddings)
+    build_time = time.perf_counter() - t0
+    return index, build_time
+
+
+def bench_usearch(index: USearchIndex, query_vecs: np.ndarray, topk: int = 5) -> float:
+    """USearch HNSW approximate nearest-neighbour — O(log N) per query."""
+    latencies: list[float] = []
+    for qv in query_vecs:
+        t0 = time.perf_counter()
+        index.search(qv, topk)
+        latencies.append(time.perf_counter() - t0)
+    return float(np.mean(latencies)) * 1000  # ms
+
+
 def print_conclusion(nums: dict) -> None:
     """Render the benchmark conclusions panel with actual measured values."""
-    zvec_ms = nums["zvec_ms"]
-    faiss_ms = nums["faiss_ms"]
-    chroma_ms = nums["chroma_ms"]
-    numpy_ms = nums["numpy_ms"]
+    zvec_ms    = nums["zvec_ms"]
+    faiss_ms   = nums["faiss_ms"]
+    usearch_ms = nums["usearch_ms"]
+    chroma_ms  = nums["chroma_ms"]
+    numpy_ms   = nums["numpy_ms"]
 
     lines = (
         f"[dim]Measured on {N_PATIENTS:,} × {EMBEDDING_DIM}D FP32 · top-5 · macOS ARM64[/dim]\n\n"
-        f"[bold cyan]FAISS HNSW[/bold cyan]       [yellow]{faiss_ms:.2f}ms[/yellow] · Fastest raw search · no persist · no filter\n"
-        f"                 [dim]→ Best when: batch ML pipelines, max throughput,[/dim]\n"
-        f"                 [dim]  you'll build persistence yourself[/dim]\n\n"
-        f"[bold bright_green]zvec HNSW[/bold bright_green]        [yellow]{zvec_ms:.2f}ms[/yellow] · FAISS-class speed + persistence + filtering\n"
+        f"[bold bright_red]USearch HNSW[/bold bright_red]     [yellow]{usearch_ms:.2f}ms[/yellow] · Fastest overall · manual persist · no Python filter\n"
+        f"                 [dim]→ Best when: max throughput, you manage persistence,[/dim]\n"
+        f"                 [dim]  filtering handled externally (e.g. Polars pre-filter)[/dim]\n\n"
+        f"[bold cyan]FAISS HNSW[/bold cyan]       [yellow]{faiss_ms:.2f}ms[/yellow] · Fast raw search · no persist · no filter\n"
+        f"                 [dim]→ Best when: batch ML pipelines, rebuild index each run[/dim]\n\n"
+        f"[bold bright_green]zvec HNSW[/bold bright_green]        [yellow]{zvec_ms:.2f}ms[/yellow] · Automatic persist + native filtering\n"
         f"                 [dim]→ Best when: CLIs, desktop/edge apps, data pipes,[/dim]\n"
         f"                 [dim]  HIPAA-sensitive data (stays local)[/dim]\n\n"
         f"[bold magenta]ChromaDB embed[/bold magenta]   [yellow]{chroma_ms:.2f}ms[/yellow] · Easiest API · rich LLM ecosystem\n"
@@ -1103,12 +1141,12 @@ def main() -> None:
     res5 = semantic_search(collection, q5_vec, df, topk=5, filter_expr=filter5)
     console.print(results_table(res5, "Top 5 Endocrinology / Emergency Matches"))
 
-    # ── Phase 5: Four-Way Performance Benchmark ─────────────────────────────
+    # ── Phase 5: Five-Way Performance Benchmark ──────────────────────────────
     console.print()
-    console.print(Rule("[bold cyan]Phase 5 · Four-Way Performance Benchmark[/bold cyan]"))
+    console.print(Rule("[bold cyan]Phase 5 · Five-Way Performance Benchmark[/bold cyan]"))
     console.print(
-        f"  Libraries: [cyan]FAISS HNSW[/cyan]  |  [bright_green]zvec HNSW[/bright_green]  |  "
-        f"[magenta]ChromaDB embedded[/magenta]  |  [white]NumPy brute-force[/white]\n"
+        f"  Libraries: [bright_red]USearch HNSW[/bright_red]  |  [cyan]FAISS HNSW[/cyan]  |  "
+        f"[bright_green]zvec HNSW[/bright_green]  |  [magenta]ChromaDB embedded[/magenta]  |  [white]NumPy brute-force[/white]\n"
         f"  [dim](Note: ChromaDB setup may take ~15–30s — Python + hnswlib overhead)[/dim]\n"
     )
 
@@ -1127,6 +1165,14 @@ def main() -> None:
     # Normalise query vectors for FAISS cosine (inner product on L2-normed vecs)
     q_norms = np.linalg.norm(q_vecs, axis=1, keepdims=True)
     q_vecs_norm = (q_vecs / (q_norms + 1e-9)).astype(np.float32)
+
+    # Step A2 — Build USearch index
+    with console.status("[bright_red][Step A2] Building USearch HNSW index…"):
+        usearch_index, usearch_build_time = setup_usearch_index(embeddings)
+    console.print(
+        f"  [green]✓[/green] USearch HNSW built in [yellow]{usearch_build_time:.2f}s[/yellow]"
+        f"  ({N_PATIENTS:,} vectors, C++ SimSIMD — cosine handled internally)"
+    )
 
     # Step B — Build ChromaDB collection
     console.print(
@@ -1149,12 +1195,14 @@ def main() -> None:
 
     # Step C — Run all benchmarks
     console.print(
-        f"\n  [dim][Step C] Running all 4 query benchmarks ({N_BENCHMARK_QUERIES} queries each)…[/dim]\n"
+        f"\n  [dim][Step C] Running all 5 query benchmarks ({N_BENCHMARK_QUERIES} queries each)…[/dim]\n"
     )
     with console.status("[cyan]Benchmarking NumPy brute-force…"):
         numpy_ms = bench_numpy(embeddings, q_vecs)
     with console.status("[cyan]Benchmarking FAISS HNSW…"):
         faiss_ms = bench_faiss(faiss_index, q_vecs_norm)
+    with console.status("[bright_red]Benchmarking USearch HNSW…"):
+        usearch_ms = bench_usearch(usearch_index, q_vecs)
     with console.status("[cyan]Benchmarking zvec HNSW…"):
         zvec_ms = bench_zvec(collection, q_vecs)
     with console.status("[cyan]Benchmarking zvec HNSW + age filter…"):
@@ -1177,6 +1225,11 @@ def main() -> None:
     build_table.add_column("Time", justify="right", width=12)
     build_table.add_column("Notes", style="dim", width=50)
     build_table.add_row("NumPy", "~0 ms", "Just holds a reference to the array")
+    build_table.add_row(
+        "[bright_red]USearch HNSW[/bright_red]",
+        f"[bright_red]{usearch_build_time:.2f}s[/bright_red]",
+        "C++ SimSIMD, single header, cosine native",
+    )
     build_table.add_row(
         "[cyan]FAISS HNSW[/cyan]",
         f"[cyan]{faiss_build_time:.2f}s[/cyan]",
@@ -1207,8 +1260,16 @@ def main() -> None:
     search_table.add_column("Avg Latency", justify="right", width=14)
     search_table.add_column("QPS", justify="right", width=10)
     search_table.add_column("Filter", width=7, justify="center")
-    search_table.add_column("Persist", width=10, justify="center")
+    search_table.add_column("Persist", width=12, justify="center")
     search_table.add_column("Backend", width=22)
+    search_table.add_row(
+        "[bright_red]USearch HNSW[/bright_red]",
+        f"[bright_red]{usearch_ms:.2f} ms[/bright_red]",
+        f"[bright_red]{1000 / usearch_ms:.0f}[/bright_red]",
+        "[red]✗ (Py)[/red]",
+        "[yellow]✓ manual[/yellow]",
+        "C++ SimSIMD/unum",
+    )
     search_table.add_row(
         "[cyan]FAISS HNSW[/cyan]",
         f"[cyan]{faiss_ms:.2f} ms[/cyan]",
@@ -1230,7 +1291,7 @@ def main() -> None:
         f"[bright_green]{zvec_ms:.2f} ms[/bright_green]",
         f"[bright_green]{1000 / zvec_ms:.0f}[/bright_green]",
         "[green]✓[/green]",
-        "[green]✓ disk[/green]",
+        "[green]✓ auto disk[/green]",
         "C++ Proxima/SIMD",
     )
     search_table.add_row(
@@ -1254,7 +1315,7 @@ def main() -> None:
     )
     filter_table.add_column("Method", style="bright_white", width=22)
     filter_table.add_column("Avg Latency", justify="right", width=14)
-    filter_table.add_column("Filtering Approach", style="dim", width=48)
+    filter_table.add_column("Filtering Approach", style="dim", width=52)
     filter_table.add_row(
         "[bright_green]zvec + filter[/bright_green]",
         f"[bright_green]{zvec_filt_ms:.2f} ms[/bright_green]",
@@ -1264,6 +1325,11 @@ def main() -> None:
         "[magenta]ChromaDB + filter[/magenta]",
         f"[magenta]{chroma_filt_ms:.2f} ms[/magenta]",
         "HNSW + hnswlib metadata post-filter",
+    )
+    filter_table.add_row(
+        "[bright_red]USearch[/bright_red]",
+        "[dim]N/A[/dim]",
+        "Filter not in Python bindings yet (C++/Rust only)",
     )
     filter_table.add_row(
         "[cyan]FAISS[/cyan]",
@@ -1295,7 +1361,7 @@ def main() -> None:
         )
     console.print(f"\n{msg}\n")
 
-    # Scale projection table — now with FAISS column
+    # Scale projection table — HNSW scales O(log N), brute-force O(N·D)
     scale_table = Table(
         title="HNSW vs Brute-Force Scaling Projection",
         box=box.SIMPLE_HEAD,
@@ -1304,23 +1370,25 @@ def main() -> None:
     )
     scale_table.add_column("Dataset Size", width=16)
     scale_table.add_column("NumPy (est.)", justify="right", width=14)
-    scale_table.add_column("FAISS HNSW (est.)", justify="right", width=18)
-    scale_table.add_column("zvec HNSW (est.)", justify="right", width=18)
+    scale_table.add_column("USearch (est.)", justify="right", width=16)
+    scale_table.add_column("FAISS (est.)", justify="right", width=14)
+    scale_table.add_column("zvec (est.)", justify="right", width=13)
     scale_table.add_column("zvec Advantage", justify="right", width=16)
 
-    # Brute-force scales O(N·D); HNSW scales O(log N)
     for n_scale in [10_000, 100_000, 1_000_000, 10_000_000]:
         scale_factor = n_scale / N_PATIENTS
-        numpy_est = numpy_ms * scale_factor
-        log_factor = math.log(n_scale) / math.log(N_PATIENTS)
-        faiss_est = faiss_ms * log_factor
-        hnsw_est = zvec_ms * log_factor
+        numpy_est   = numpy_ms * scale_factor
+        log_factor  = math.log(n_scale) / math.log(N_PATIENTS)
+        usearch_est = usearch_ms * log_factor
+        faiss_est   = faiss_ms   * log_factor
+        hnsw_est    = zvec_ms    * log_factor
         adv = numpy_est / hnsw_est
         marker = " ←" if n_scale == N_PATIENTS else ""
         style = "bright_green" if adv >= 5 else "yellow" if adv >= 2 else "dim"
         scale_table.add_row(
             f"{n_scale:>10,}{marker}",
             f"{numpy_est:.1f} ms",
+            f"[bright_red]{usearch_est:.1f} ms[/bright_red]",
             f"[cyan]{faiss_est:.1f} ms[/cyan]",
             f"[{style}]{hnsw_est:.1f} ms[/{style}]",
             f"[{style}]{adv:.1f}×[/{style}]",
@@ -1331,12 +1399,14 @@ def main() -> None:
     console.print()
     console.print(Rule("[bold bright_yellow]Phase 6 · Benchmark Conclusions[/bold bright_yellow]"))
     nums = {
-        "zvec_ms": zvec_ms,
-        "faiss_ms": faiss_ms,
-        "chroma_ms": chroma_ms,
-        "numpy_ms": numpy_ms,
-        "insert_time": insert_time,
-        "faiss_build_time": faiss_build_time,
+        "zvec_ms":           zvec_ms,
+        "faiss_ms":          faiss_ms,
+        "usearch_ms":        usearch_ms,
+        "chroma_ms":         chroma_ms,
+        "numpy_ms":          numpy_ms,
+        "insert_time":       insert_time,
+        "faiss_build_time":  faiss_build_time,
+        "usearch_build_time": usearch_build_time,
         "chroma_build_time": chroma_build_time,
     }
     print_conclusion(nums)
@@ -1381,8 +1451,9 @@ def main() -> None:
         f"[bold]Embedding model[/bold]      {EMBEDDING_MODEL}  ({EMBEDDING_DIM}D FP32, ONNX)\n"
         f"[bold]zvec index[/bold]           HNSW · InvertIndex on 4 numeric fields\n"
         f"[bold]Insert speed[/bold]         {insert_tput:.0f} docs/sec  ({insert_time:.2f}s total)\n\n"
-        f"[bold]FAISS HNSW latency[/bold]   {faiss_ms:.2f} ms avg  →  {1000 / faiss_ms:.0f} QPS  [dim](fastest raw, no persist/filter)[/dim]\n"
-        f"[bold]zvec HNSW latency[/bold]    {zvec_ms:.2f} ms avg  →  {1000 / zvec_ms:.0f} QPS  [dim](C++ SIMD + persist + filter)[/dim]\n"
+        f"[bold]USearch HNSW latency[/bold] {usearch_ms:.2f} ms avg  →  {1000 / usearch_ms:.0f} QPS  [dim](fastest · manual persist · no Python filter)[/dim]\n"
+        f"[bold]FAISS HNSW latency[/bold]   {faiss_ms:.2f} ms avg  →  {1000 / faiss_ms:.0f} QPS  [dim](fast · no persist · no filter)[/dim]\n"
+        f"[bold]zvec HNSW latency[/bold]    {zvec_ms:.2f} ms avg  →  {1000 / zvec_ms:.0f} QPS  [dim](C++ SIMD + auto persist + native filter)[/dim]\n"
         f"[bold]ChromaDB latency[/bold]     {chroma_ms:.2f} ms avg  →  {1000 / chroma_ms:.0f} QPS  [dim](Python + hnswlib, LLM ecosystem)[/dim]\n"
         f"[bold]NumPy exact[/bold]          {numpy_ms:.2f} ms avg  →  {1000 / numpy_ms:.0f} QPS  [dim](brute-force, zero deps)[/dim]\n\n"
         f"[bold]Key insight[/bold]          zvec = SQLite for vectors — embedded, persistent, SIMD-fast"
